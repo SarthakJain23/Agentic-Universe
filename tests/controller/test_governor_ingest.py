@@ -158,3 +158,14 @@ def test_did_health_flags_the_bad_number_hour_by_hour():
     assert h["D1"].ratio > 1.0 and h["D1"].p_low > 0.5   # a flagged number in the pool makes the others look better
     target, why = H.target_distribution(h, ["D1", "D2", "D3", "D4"], {"D1": 0.4, "D2": 0.3, "D3": 0.3}, 0.7, 200, 0.04)
     assert "D2" not in target and target["D4"] == 0.04 and abs(sum(target.values()) - 1) < 1e-9
+
+
+def test_pairwise_ratio_is_stable_when_the_pool_changes():
+    # Before: D1 (code 0) and a flagged D2 (code 1). After: D2 removed, a fresh D3 (code 2) probed.
+    before = [(b, 0, 100, 30) for b in range(10)] + [(b, 1, 100, 12) for b in range(10)]
+    after = [(b, 0, 100, 18) for b in range(10, 20)] + [(b, 2, 20, 6) for b in range(10, 20)]
+    r_d2, p_d2, _ = H.pair_ratio(before, 1, 0)
+    assert r_d2 < 0.5 and p_d2 < 1e-3                      # D2 vs D1: clearly worse
+    r_now, _, _ = H.pair_ratio(after, 0, 2)                # D1 vs D3 exists now...
+    r_old, _, n_old = H.pair_ratio(before, 0, 2)           # ...but has no shared history
+    assert r_now is not None and r_old is None and n_old == 0   # -> no change-point claim about D1

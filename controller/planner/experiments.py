@@ -124,9 +124,13 @@ def plan_routine(ctx: Ctx) -> list[Change]:
                 if c is None:
                     continue
                 r = recent_t.compare(ctx.data.code(dim, o), ctx.data.code(dim, st["champion"]))
-                fading = r.n_a >= s.fading_min_n and r.p_worse >= s.drop_prob
-                if (c.n_a >= s.drop_min_n and c.p_worse >= s.drop_prob) or fading:
-                    c = r if fading and not (c.n_a >= s.drop_min_n and c.p_worse >= s.drop_prob) else c
+                # The bar to remove an arm scales with how much traffic removal moves: a 6% arm goes at
+                # P(worse) >= 0.8; a raised arm first steps back to 6% (below) and is only removed at 0.95.
+                raised = target.get(o, 0) > s.explore_share + 1e-6
+                bar = s.drop_prob_raised if raised else s.drop_prob
+                fading = r.n_a >= s.fading_min_n and r.p_worse >= bar
+                if (c.n_a >= s.drop_min_n and c.p_worse >= bar) or fading:
+                    c = r if fading and not (c.n_a >= s.drop_min_n and c.p_worse >= bar) else c
                     target.pop(o, None)
                     active -= 1
                     kinds.append("drop_arm")
@@ -134,8 +138,16 @@ def plan_routine(ctx: Ctx) -> list[Change]:
                     intents.append({"type": "arm", "dim": dim, "segment": "*", "option": o, "status": "dropped",
                                     "note": f"P(worse)={c.p_worse:.2f} n={c.n_a}"})
                     impact += 0.02
+                elif raised and ((r.n_a >= s.raise_min_n and r.p_worse >= s.unraise_prob) or
+                                 (c.n_a >= s.drop_min_n and c.p_worse >= s.drop_prob)):
+                    # It earned extra traffic by being ahead; it no longer is. Give the traffic back - we
+                    # don't need proof that it is worse to stop over-exposing customers to it.
+                    target[o] = s.explore_share
+                    kinds.append("drop_arm")
+                    notes.append(f"scale {o} back to {s.explore_share:.0%} (no longer ahead: 36h lift {r.lift:+.1%} "
+                                 f"n={r.n_a}; {s.adapt_window_days}d P(worse)={c.p_worse:.2f})")
                 elif c.n_a >= s.raise_min_n and c.p_better >= s.raise_prob and target.get(o, 0) < s.raise_share - 1e-6 \
-                        and (r.n_a < 50 or r.p_better >= 0.5):
+                        and (r.n_a < 50 or r.p_better >= s.raise_recent_p):
                     target[o] = s.raise_share
                     kinds.append("raise_arm")
                     notes.append(f"give {o} more traffic (P(better)={c.p_better:.2f}, n={c.n_a})")

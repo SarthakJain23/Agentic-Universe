@@ -60,6 +60,31 @@ def assess(strata: list[tuple], name_of) -> dict[str, DidHealth]:
     return out
 
 
+def pair_ratio(strata: list[tuple], a: int, b: int) -> tuple[float | None, float, int]:
+    """Hour-stratified pickup ratio of number a vs number b, using only hours where both dialled.
+    Returns (ratio, one-sided p that a is worse, dials of a in shared hours). A pairwise ratio is stable when
+    *other* numbers come and go - unlike a ratio against "all other numbers", whose reference changes
+    whenever the pool does."""
+    by_b: dict[int, dict[int, tuple[int, int]]] = defaultdict(dict)
+    for bucket, d, n, k in strata:
+        if int(d) in (a, b):
+            by_b[int(bucket)][int(d)] = (int(n), int(k or 0))
+    obs = exp = var = 0.0
+    na = 0
+    for cells in by_b.values():
+        if a not in cells or b not in cells or cells[b][0] == 0:
+            continue
+        (n1, k1), (n2, k2) = cells[a], cells[b]
+        p = k2 / n2
+        obs += k1
+        exp += n1 * p
+        var += n1 * p * (1 - p) + (n1 ** 2) * p * (1 - p) / n2   # include the comparator's own noise
+        na += n1
+    if exp <= 0 or var <= 0:
+        return None, 1.0, na
+    return obs / exp, phi((obs - exp) / math.sqrt(var)), na
+
+
 def target_distribution(health: dict[str, DidHealth], options: list[str], current: dict, keep_ratio: float,
                         min_dials: int, probe_share: float) -> tuple[dict, dict]:
     """Steady-state allocation: numbers with enough evidence of good health share traffic in proportion
@@ -74,7 +99,7 @@ def target_distribution(health: dict[str, DidHealth], options: list[str], curren
     good = {d: h.ratio for d, h in known.items() if h.ratio >= keep_ratio or current.get(d, 0) > fair + 1e-9}
     untried = [d for d in options if d not in health or health[d].dials < min_dials]
     # A number we are using but lack evidence on keeps its current share (no data is not bad data).
-    pending = {d: current.get(d, 0.0) for d in untried if current.get(d, 0.0) > 0}
+    pending = {d: max(current.get(d, 0.0), probe_share) for d in untried if current.get(d, 0.0) > 0}
     probes = {d: probe_share for d in untried if d not in pending}
     reasons = {"good": sorted(good), "excluded": sorted(d for d in known if d not in good),
                "probing": sorted(probes), "insufficient_data": sorted(pending)}

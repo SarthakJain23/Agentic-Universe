@@ -37,8 +37,11 @@ class Settings:
     raise_share: float = 0.25           # a challenger that is probably better gets more traffic
     raise_prob: float = 0.90            # P(better) needed to raise ...
     raise_min_n: int = 150              # ... and at least this many connected calls (normal approx is poor below)
+    unraise_prob: float = 0.70          # a raised arm whose last 36h say P(worse) >= 0.7 goes back to explore share
+    raise_recent_p: float = 0.70        # a raise also needs the last 36h to agree (effects fade with exposure)
     drop_prob: float = 0.80             # P(worse) needed to drop an arm ...
     drop_min_n: int = 150               # ... once it has this many connected calls
+    drop_prob_raised: float = 0.95      # removing a raised (25%) arm moves 4x the traffic: higher bar
     promote_min_n: int = 400            # connected calls per arm before a winner can be declared
     promote_window_days: int = 2        # winners must be winning *now*: effects fade with exposure
     adapt_window_days: int = 4          # drop/raise decisions use up to 4 days so small arms reach n
@@ -66,6 +69,9 @@ class Settings:
                                         # numbers sit far lower, so the safety trigger is set well below that
     did_bad_p: float = 0.001
     did_sudden_drop: float = 0.70       # ratio now / ratio in the previous 48h: flagged = sudden, load = gradual
+    did_cooldown_hours: int = 48        # an excluded number is re-measured after this (a false alarm is recoverable;
+                                        # a truly flagged number fails again at low share and stays excluded)
+    did_reprobe_share: float = 0.02     # a number back from cooldown is re-probed small: a still-flagged one costs <2%
     did_keep_ratio: float = 0.70        # below this a number gets no weight in the steady-state target
     did_probe_share: float = 0.04       # per never-used number; keeps a bad probe under the -2% bar
     did_rebalance_min_tv: float = 0.10
