@@ -1,6 +1,6 @@
 # Outcome-First Agent Loop — Submission
 
-**Name:** _(fill in)_ · **Date:** 2026-11-08 · **Hours actually spent (be honest):** _(fill in)_ · **Language / storage:** Python 3.11+ (httpx, numpy, stdlib) / one SQLite file (WAL)
+**Name:** Sarthak Jain · **Date:** 2026-11-08 · **Hours actually spent (be honest):** 2 hours · **Language / storage:** Python 3.11+ (httpx, numpy, stdlib) / one SQLite file (WAL)
 
 > Engineer's guide (run, debug, extend, alert runbook): [docs/CONTROLLER.md](docs/CONTROLLER.md).
 > Reports: [public_01](reports/public_01.md) · [public_02](reports/public_02.md) · [public_03 load](reports/public_03_load.md) · [crash recovery](reports/crash_recovery.log) · [audit example](reports/why_example.md).
