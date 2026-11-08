@@ -1,0 +1,33 @@
+[09:38:17] scenario scenarios/public_02_incidents.yaml, simulator pid 5630 on :8731, 5 random kill -9s
+[09:38:23] kill -9 #1 after 6s at sim 2027-01-06T08:30:00+05:30 False | proposals in store: APPLIED=4
+[09:38:27] kill -9 #2 after 4s at sim 2027-01-07T22:30:00+05:30 False | proposals in store: APPLIED=10,REJECTED=1
+[09:38:34] kill -9 #3 after 7s at sim 2027-01-11T00:30:00+05:30 False | proposals in store: APPLIED=16,REJECTED=1
+[09:38:37] kill -9 #4 after 2s at sim 2027-01-11T18:30:00+05:30 False | proposals in store: APPLIED=18,REJECTED=1
+[09:38:44] controller exited before kill #5
+[09:38:44] final restart - running to completion
+[09:38:44] controller finished at sim 2027-01-14T00:00:00+05:30 True
+[09:38:44] --- invariants
+PASS nw_renewal: no proposal applied twice (6 controller versions)
+PASS nw_renewal: every APPLIED proposal in our store is live in config history at that version
+PASS nw_renewal: every controller version in the world is known to our store
+PASS nw_kyc: no proposal applied twice (1 controller versions)
+PASS nw_kyc: every APPLIED proposal in our store is live in config history at that version
+PASS nw_kyc: every controller version in the world is known to our store
+PASS ks_cancel: no proposal applied twice (13 controller versions)
+PASS ks_cancel: every APPLIED proposal in our store is live in config history at that version
+PASS ks_cancel: every controller version in the world is known to our store
+PASS no approval lost: every approved request was applied or closed with a reason 
+PASS all 11 approvals are tracked in our store with matching approval_id
+PASS no proposal refused by the API as invalid (0 FAILED)
+PASS ingested every chunk (ours 267, simulator 267)
+PASS no duplicate call events (245,008 calls)
+PASS scenario finished (2027-01-14T00:00:00+05:30)
+[09:38:44] --- grade (runs/mine_crash vs baseline) summary
+| workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
+|---|---|---|---|---|---|---|---|---|
+| ks_cancel | 0.356 | +51.0% | 0.244 | +34.4% | 0.502 | +7.4% | 35% | 97 (348) |
+| nw_kyc | 0.386 | +3.3% | 0.245 | +4.7% | 0.597 | -1.9% | 0% | 30 (29) |
+| nw_renewal | 0.439 | +1.4% | 0.266 | +1.5% | 0.551 | -0.7% | 12% | 63 (54) |
+| ALL | 0.390 | +17.9% | 0.252 | +14.7% | 0.538 | +1.0% | 24% | 190 (431) |
+20 applied — beneficial: 7, neutral: 13
+    "mttr_minutes": 210,
