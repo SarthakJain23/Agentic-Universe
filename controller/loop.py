@@ -72,8 +72,9 @@ def run(sim_url: str, db_path: str | Path, tick_minutes: int = SETTINGS.tick_min
     finished = st["finished"]
     while not finished:
         t0 = time.perf_counter()
+        step = 15 if ctl.urgent() else tick_minutes
         try:
-            adv = sim.advance(tick_minutes)
+            adv = sim.advance(step)
         except Finished:
             break
         dt = time.perf_counter() - t0

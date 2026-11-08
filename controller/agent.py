@@ -71,6 +71,12 @@ class Controller:
                 "credits": float(st["credits_remaining"]), "rss_mb": round(_rss_mb(), 1)})
             self._health_alerts(now, lag, float(st["credits_remaining"]))
 
+    def urgent(self) -> bool:
+        """True while an incident is open or a protective change awaits a human: the loop then advances in
+        15-minute ticks so an approval is applied (and verified) up to 15 minutes sooner."""
+        return bool(self.repo.open_incidents()) or any(
+            p.kind != "routine" for p in self.repo.proposals(states=R.IN_FLIGHT))
+
     def _health_alerts(self, now: int, lag: int, credits: float) -> None:
         """Loop-level alerts for on-call. Page only when a human must act now; everything else is a ticket."""
         if lag > 120:
