@@ -136,8 +136,8 @@ class Governor:
         except InvalidRequest as e:
             self._close(p, R.FAILED, now, [str(e)])
             with self.repo.tx():
-                self.repo.alert(now, "ticket", p.wf, f"proposal {p.proposal_id} refused by API: {e}",
-                                dedup=f"failed:{p.proposal_id}")
+                self.repo.alert(now, "ticket", p.wf, f"proposal {p.proposal_id} refused by API: {e} - a controller "
+                                "bug: the proposal row holds the full request", dedup=f"failed:{p.wf}:{now // 1440}")
         except Unavailable as e:
             log.warning("send of %s deferred (%s); will reconcile", p.proposal_id, e)
 

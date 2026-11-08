@@ -122,7 +122,7 @@ class Controller:
                 applied = ts_to_minute(v["applied_at"]) if v.get("applied_at") else None
                 self.repo.put_config_version(wf, v, cfg, applied)
                 if v["actor"] == "supervisor":
-                    self._on_supervisor_edit(wf, v, applied if applied is not None else now)
+                    self._on_supervisor_edit(wf, v, applied if applied is not None else now, cfg)
                 elif v["actor"].startswith("controller") and not (v.get("proposal_id") and
                                                                   self.repo.proposal(v["proposal_id"])):
                     self.repo.alert(now, "page", wf, f"[{wf}] config v{v['version']} was applied by a controller "
@@ -130,8 +130,15 @@ class Controller:
                                     "driving the same workflow: stop one before it fights the other.",
                                     dedup=f"foreign:{wf}:{v['version']}")
 
-    def _on_supervisor_edit(self, wf: str, v: dict, at: int) -> None:
+    def _on_supervisor_edit(self, wf: str, v: dict, at: int, cfg: dict) -> None:
         dims = v.get("changed_dims") or []
+        # The supervisor's choice is authoritative: an option they put traffic on is no longer "dropped"
+        # or "retired" in our registry (otherwise we would try to drain their choice away).
+        for dim in dims:
+            live = ((cfg.get("allocations") or {}).get("default") or {}).get(dim) or {}
+            for opt, row in self.repo.arm_status(wf, dim).items():
+                if live.get(opt, 0) > 0 and row["status"] in ("dropped", "retired", "cooldown"):
+                    self.repo.clear_arm(wf, dim, "*", opt)
         until = at + self.s.supervisor_freeze_hours * 60
         freeze = self.repo.meta(f"freeze:{wf}", {}) or {}
         for d in dims:
@@ -199,6 +206,10 @@ class Controller:
         busy |= {i.get("kind") for p in self.repo.proposals(wf=ctx.wf, states=[R.REJECTED])
                  if (p.decided_minute or p.created_minute) >= cooldown
                  for i in p.request.get("evidence", {}).get("changes", [])}
+        # The API refused this kind of change recently (our bug): back off instead of retrying every tick.
+        busy |= {i.get("kind") for p in self.repo.proposals(wf=ctx.wf, states=[R.FAILED, R.FORBIDDEN])
+                 if p.created_minute >= ctx.now - 120
+                 for i in p.request.get("evidence", {}).get("changes", [])}
         changes: list[Change] = []
         if "did_degraded" not in busy:
             changes += callerid.plan_safety(ctx)
@@ -238,6 +249,9 @@ class Controller:
             return
         self._last_routine_eval[ctx.wf] = ctx.now
         changes = schedule.plan(ctx) + experiments.plan_routine(ctx) + callerid.plan_rebalance(ctx)
+        refused = {i.get("kind") for p in self.repo.proposals(wf=ctx.wf, states=[R.FAILED, R.FORBIDDEN])
+                   if p.created_minute >= ctx.now - 120 for i in p.request.get("evidence", {}).get("changes", [])}
+        changes = [c for c in changes if c.kind not in refused]
         if not changes:
             return
         routed = route(ctx, changes, "routine")

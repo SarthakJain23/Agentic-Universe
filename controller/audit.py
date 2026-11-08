@@ -64,7 +64,11 @@ def why(conn: sqlite3.Connection, wf: str, at: str) -> str:
     if wfc is not None and v["applied_minute"] is not None:
         a = v["applied_minute"]
         nxt = next((x for x in versions if x["version"] == v["version"] + 1), None)
-        end = min(a + MIN_PER_DAY, nxt["applied_minute"] if nxt and nxt["applied_minute"] else a + MIN_PER_DAY)
+        # Measure the next 24h, or until the next change to the SAME dimensions (unrelated changes in
+        # between, e.g. a caller-ID rebalance after a prompt fix, don't end the window).
+        same = next((x for x in versions if x["version"] > v["version"] and x["applied_minute"] is not None
+                     and set(x["changed_dims"]) & set(v["changed_dims"])), None)
+        end = min(a + MIN_PER_DAY, same["applied_minute"] if same else a + MIN_PER_DAY)
         L += ["", "## What happened next", "",
               f"- 24h before: {_kpi(conn, wfc, a - MIN_PER_DAY, a)}",
               f"- after (until {label(end)}): {_kpi(conn, wfc, a, end)}"]

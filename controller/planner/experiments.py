@@ -192,7 +192,7 @@ def plan_decay(ctx: Ctx) -> list[Change]:
     out = []
     for dim in EXPERIMENT_DIMS:
         st = arm_state(ctx, dim)
-        if st["draining"]:
+        if st["draining"] and any(o not in st["draining"] for o in st["dist"]):
             out.append(_drain(ctx, dim, st))
             continue
         if not st["holdout"] or ctx.now % s.decay_check_every_minutes:

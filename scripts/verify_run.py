@@ -56,6 +56,8 @@ def main() -> int:
                      f"{'(stale/lapsed, not forced: ' + str(explained) + ')' if explained else ''}{stuck if stuck else ''}")
     unknown = [x["approval_id"] for x in approvals if x["proposal_id"] not in ours or ours[x["proposal_id"]][2] != x["approval_id"]]
     check(not unknown, f"all {len(approvals)} approvals are tracked in our store with matching approval_id")
+    failed = db.execute("SELECT COUNT(*) FROM proposals WHERE state='FAILED'").fetchone()[0]
+    check(failed == 0, f"no proposal refused by the API as invalid ({failed} FAILED)")
     st = sim.get("/sim/state").json()
     last = db.execute("SELECT MAX(chunk) FROM chunks").fetchone()[0]
     check(last == st["chunks"] - 1, f"ingested every chunk (ours {last}, simulator {st['chunks'] - 1})")
