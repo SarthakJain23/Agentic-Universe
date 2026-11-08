@@ -30,7 +30,24 @@ def fingerprint(sim: SimClient) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+_LOCK = None
+
+
+def single_writer(db_path: str | Path) -> None:
+    """Exclusive advisory lock next to the store: a second controller on the same store exits at once
+    instead of racing the first (double proposals, stale applies)."""
+    global _LOCK
+    import fcntl
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    _LOCK = open(str(db_path) + ".lock", "w")
+    try:
+        fcntl.flock(_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"another controller holds {db_path}.lock - refusing to run two writers")
+
+
 def open_store(sim: SimClient, db_path: str | Path):
+    single_writer(db_path)
     fp = fingerprint(sim)
     conn = open_for_run(db_path, fp)
     # Same scenario but a *restarted* simulator is a new world (the sim keeps state in memory): detect it

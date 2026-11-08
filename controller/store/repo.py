@@ -65,6 +65,14 @@ class Repo:
     def set_meta(self, key: str, value) -> None:
         set_meta(self.conn, key, value)
 
+    def store_id(self) -> str:
+        sid = self.meta("store_id")
+        if sid is None:
+            import secrets
+            sid = secrets.token_hex(2)
+            self.set_meta("store_id", sid)
+        return sid
+
     # ------------------------------------------------------------------ audit
     def decide(self, wf: str | None, minute: int, kind: str, summary: str, evidence: dict | None = None,
                proposal_id: str | None = None, incident_id: str | None = None, dedup: str | None = None) -> None:

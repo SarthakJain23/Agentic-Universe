@@ -12,18 +12,29 @@ def _health(ctx: Ctx, hours: int) -> dict[str, H.DidHealth]:
 
 
 def degraded(ctx: Ctx) -> tuple[list[str], dict]:
+    """Spam flagging is a *change point*: a number's pickup ratio falls sharply against its own recent past.
+    Load also lowers a number's ratio (health = base / (1 + (load/l0)^2)), but slowly (load decays over
+    ~2 days), and the cure for load is rebalancing, not exclusion. So the safety trigger needs BOTH a low
+    ratio now AND a significant drop versus the same number's previous 48h."""
     s = ctx.s
     cur = dist(ctx.config, "default", "caller_id")
-    short, long_ = _health(ctx, s.did_window_hours), _health(ctx, s.did_long_window_hours)
-    bad = []
+    w = s.did_window_hours
+    short = _health(ctx, w)
+    prior_rows = ctx.data.did_strata(ctx.wf, ctx.now - w * 60 - 48 * 60, ctx.now - w * 60)
+    prior = H.assess(prior_rows, lambda c: ctx.data.opt("caller_id", c))
+    bad, drops = [], {}
     for d in cur:
-        for h in (short.get(d), long_.get(d)):
-            if h and h.dials >= s.did_min_dials and h.ratio is not None and h.ratio < s.did_bad_ratio \
-                    and h.p_low < s.did_bad_p:
-                bad.append(d)
-                break
+        h, p = short.get(d), prior.get(d)
+        if not h or h.dials < s.did_min_dials or h.ratio is None or h.ratio >= s.did_bad_ratio or h.p_low >= s.did_bad_p:
+            continue
+        if p is None or p.dials < s.did_min_dials or p.ratio is None:
+            continue   # no history to compare with: rebalancing (not exclusion) handles never-measured numbers
+        drop = h.ratio / p.ratio
+        drops[d] = round(drop, 3)
+        if drop < s.did_sudden_drop:
+            bad.append(d)
     ev = {"window_6h": {d: h.as_dict() for d, h in short.items()},
-          "window_24h": {d: h.as_dict() for d, h in long_.items()}}
+          "prior_48h": {d: h.as_dict() for d, h in prior.items()}, "drop_vs_prior": drops}
     return bad, ev
 
 
@@ -49,7 +60,7 @@ def plan_safety(ctx: Ctx) -> list[Change]:
     if not target:
         return []
     cur = dist(ctx.config, "default", "caller_id")
-    worst = min((ev["window_6h"].get(d) or ev["window_24h"].get(d) or {}).get("ratio") or 1 for d in bad)
+    worst = min((ev["window_6h"].get(d) or {}).get("ratio") or 1 for d in bad)
     share = sum(cur.get(d, 0) for d in bad)
 
     def edit(cfg: dict) -> None:
@@ -60,7 +71,8 @@ def plan_safety(ctx: Ctx) -> list[Change]:
         kind="did_degraded", summary=f"Stop dialling from {', '.join(bad)}: pickup {worst:.0%} of the other numbers",
         rationale=("Caller IDs are assigned at random per dial, so in the same hours every number reaches the same "
                    f"people. {', '.join(bad)} connects significantly less often (ratio < {ctx.s.did_bad_ratio}, "
-                   f"p < {ctx.s.did_bad_p}) - consistent with spam flagging. Traffic moves to healthy numbers."),
+                   f"p < {ctx.s.did_bad_p}) and fell sharply against its own previous 48h - a change point consistent "
+                   "with spam flagging, not gradual load. Traffic moves to healthy numbers."),
         edit=edit, evidence=ev | {"target": target, "why": why},
         dry_run={"method": "observed pickup ratio vs other numbers in the same hours",
                  "share_moved": round(share, 3), "expected_pickup_gain_on_moved_share": round(1 / worst - 1, 3)
@@ -79,7 +91,14 @@ def plan_rebalance(ctx: Ctx) -> list[Change]:
         return []
     target, why = _target(ctx, set())
     cur = dist(ctx.config, "default", "caller_id")
-    if not target or tv(cur, target) < s.did_rebalance_min_tv:
+    if not target:
+        return []
+    # Damped update: move halfway. Health responds to load with a ~2-day lag, so jumping straight to the
+    # ratio-weighted target overshoots and oscillates; halving the step converges.
+    excluded = set(why.get("excluded", []))
+    target = quantize({o: 0.5 * cur.get(o, 0.0) * (o not in excluded) + 0.5 * target.get(o, 0.0)
+                       for o in set(cur) | set(target)})
+    if tv(cur, target) < s.did_rebalance_min_tv:
         return []
 
     def edit(cfg: dict) -> None:

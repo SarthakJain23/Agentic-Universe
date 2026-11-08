@@ -63,10 +63,15 @@ def assess(strata: list[tuple], name_of) -> dict[str, DidHealth]:
 def target_distribution(health: dict[str, DidHealth], options: list[str], current: dict, keep_ratio: float,
                         min_dials: int, probe_share: float) -> tuple[dict, dict]:
     """Steady-state allocation: numbers with enough evidence of good health share traffic in proportion
-    to ratio^2 (healthier numbers carry more, but load is still spread - health falls with load); numbers
+    to their ratio (less loaded = healthier numbers carry more; equal health <=> equal load is the fixed
+    point, so shares converge to balance instead of overshooting); numbers
     never tried get a small probe; numbers below `keep_ratio` get nothing."""
     known = {d: h for d, h in health.items() if d in options and h.dials >= min_dials and h.ratio is not None}
-    good = {d: h.ratio ** 2 for d, h in known.items() if h.ratio >= keep_ratio}
+    # A low ratio is only damning if the number is NOT carrying more than its fair share: an overloaded
+    # number looks bad next to a fresh one purely because of load, and rebalancing (not exclusion) fixes that.
+    in_use = [d for d in known if current.get(d, 0) > 0] or list(known)
+    fair = 1.0 / max(len(in_use), 1)
+    good = {d: h.ratio for d, h in known.items() if h.ratio >= keep_ratio or current.get(d, 0) > fair + 1e-9}
     untried = [d for d in options if d not in health or health[d].dials < min_dials]
     # A number we are using but lack evidence on keeps its current share (no data is not bad data).
     pending = {d: current.get(d, 0.0) for d in untried if current.get(d, 0.0) > 0}

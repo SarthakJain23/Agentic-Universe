@@ -40,6 +40,15 @@ class Credits:
         return rem >= cost and (incident or rem - cost >= floor)
 
 
+def incident_id(ctx: Ctx, prompt: str) -> str:
+    """Deterministic: one incident per (workflow, prompt, config version that put it live). Re-detecting
+    after a crash upserts the same row instead of opening a duplicate."""
+    v = next((v["version"] for v in reversed(ctx.repo.config_versions(ctx.wf))
+              if v["config"].get("prompt_version") == prompt and ("prompt_version" in v["changed_dims"] or v["version"] == 1)),
+             ctx.version)
+    return f"inc.{ctx.wf}.halluc.{prompt}.v{v}"
+
+
 def prompt_live_since(ctx: Ctx, prompt: str) -> int:
     """Minute the current prompt went live (from our config mirror), or the start of our records."""
     since = None
@@ -99,7 +108,9 @@ def screen_prompt_change(ctx: Ctx, credits: Credits, sim: SimClient) -> dict | N
         return None
     reason = (f"supervisor prompt {prompt} fails validation: pass rate {v['pass_rate']:.3f} on n={v['n']} "
               f"< approval bar {bar}")
-    inc = {"id": f"inc.{ctx.wf}.halluc.{ctx.now}", "wf": ctx.wf, "kind": "hallucination", "subject": prompt,
+    if ctx.repo.incident(incident_id(ctx, prompt)):
+        return None
+    inc = {"id": incident_id(ctx, prompt), "wf": ctx.wf, "kind": "hallucination", "subject": prompt,
            "state": "open", "opened_minute": ctx.now,
            "data": {"detection": {"baseline_rate": baseline(ctx), "validation": v}, "reason": reason, "tried": [],
                     "prompt_live_since": prompt_live_since(ctx, prompt)}}
@@ -119,11 +130,13 @@ def detect(ctx: Ctx) -> dict | None:
     s = ctx.s
     since = prompt_live_since(ctx, prompt)
     win = ctx.data.prompt_stats(ctx.wf, max(since, ctx.now - s.halluc_window_hours * 60), ctx.now, prompt).get(prompt, {})
-    chg = ctx.data.prompt_stats(ctx.wf, since, ctx.now, prompt).get(prompt, {})
+    # SPRT horizon: since the prompt went live, capped at 48h - a prompt that has been fine for days is
+    # tested on recent behaviour, and the query cost stays flat however long the history is.
+    chg = ctx.data.prompt_stats(ctx.wf, max(since, ctx.now - 48 * 60), ctx.now, prompt).get(prompt, {})
     chk = HL.check(win, chg, baseline(ctx), s)
-    if not chk.triggered:
+    if not chk.triggered or ctx.repo.incident(incident_id(ctx, prompt)):
         return None
-    inc = {"id": f"inc.{ctx.wf}.halluc.{ctx.now}", "wf": ctx.wf, "kind": "hallucination", "subject": prompt,
+    inc = {"id": incident_id(ctx, prompt), "wf": ctx.wf, "kind": "hallucination", "subject": prompt,
            "state": "open", "opened_minute": ctx.now,
            "data": {"detection": chk.evidence, "reason": chk.reason, "tried": [], "prompt_live_since": since}}
     ctx.repo.put_incident(inc)
@@ -222,8 +235,7 @@ def _fix_change(ctx: Ctx, inc: dict, prompt: str, source: str, val: dict) -> Cha
     sup = _last_actor(ctx, bad)
     reverts = f" (reverts the {sup} change to {bad})" if sup == "supervisor" else ""
     return Change(
-        kind="prompt_fix", summary=f"Switch prompt {bad} -> {prompt}{reverts}: hallucination flags "
-                                   f"{_rate(det)} vs baseline {det['baseline_rate']:.1%}",
+        kind="prompt_fix", summary=f"Switch prompt {bad} -> {prompt}{reverts}: {_problem(det, ctx)}",
         rationale=(f"{inc['data']['reason']}. Candidate {prompt} chosen because it is "
                    + ("a prompt that already ran on this workflow with a normal flag rate"
                       if source == "known_good" else "an LLM suggestion") +
@@ -235,7 +247,7 @@ def _fix_change(ctx: Ctx, inc: dict, prompt: str, source: str, val: dict) -> Cha
                  "candidate_history": stats.get(prompt), "bad_prompt_since_live": stats.get(bad),
                  "validation": val},
         impact=0.95, customer_facing=True, safety=True,
-        intents=[{"type": "incident", "id": inc["id"], "state": "verifying", "candidate": prompt}])
+        intents=[{"type": "incident", "id": inc["id"], "state": "verifying", "candidate": prompt, "source": source}])
 
 
 def progress(ctx: Ctx, inc: dict, proposals) -> None:
@@ -275,28 +287,48 @@ def _verify(ctx: Ctx, inc: dict) -> None:
         inc["subject"] = live
         _note(ctx, inc, f"fix {live} still hallucinating ({k}/{n}); trying next candidate")
         return
-    # Engagement check: the fix must not trade hallucinations for a script nobody stays on.
-    pre = ctx.data.prompt_stats(ctx.wf, data.get("prompt_live_since", 0) - 3 * DAY,
-                                data.get("prompt_live_since", 0), None)
-    pre_n = sum(v["connected"] for p, v in pre.items() if p != inc["subject"])
-    pre_k = sum(v["engaged"] for p, v in pre.items() if p != inc["subject"])
-    if n >= 200 and pre_n >= 200:
-        c = stratified_compare([(n, st.get("engaged", 0), pre_n, pre_k)])
-        data["engagement_check"] = c.as_dict()
-        if c.lift < -s.fix_engagement_max_drop and c.p_worse >= 0.95:
-            data["tried"].append(live)
-            inc["state"] = "open"
-            inc["subject"] = live
-            _note(ctx, inc, f"fix {live} cut engagement {c.lift:+.1%}; trying next candidate")
-            return
+    # Engagement check: the fix must not trade hallucinations for a script nobody stays on (memo 04).
+    # A known-good prompt already has production engagement evidence on this workflow; an LLM suggestion
+    # does not, so only those are checked - against the pre-incident prompt, stratified by hour of day so
+    # an afternoon-only sample is compared with afternoons.
+    needs_check = data.get("candidate_source") == "llm"
+    if needs_check:
+        live_since = data.get("prompt_live_since", 0)
+        c = _hourly_engagement_compare(ctx, live, since, ctx.now, live_since - 3 * DAY, live_since, inc["subject"])
+        if c is not None and c.n_a >= 400 and c.n_b >= 400:
+            data["engagement_check"] = c.as_dict()
+            if c.lift < -s.fix_engagement_max_drop and c.p_worse >= 0.95:
+                data["tried"].append(live)
+                inc["state"] = "open"
+                inc["subject"] = live
+                _note(ctx, inc, f"fix {live} cut engagement {c.lift:+.1%} vs the pre-incident prompt (hour-matched, "
+                                f"n={c.n_a}); trying next candidate")
+                return
+    else:
+        data.setdefault("engagement_check", {"skipped": "known-good prompt: production engagement evidence exists"})
     if verdict == "h0" and n >= 200 and "engagement_check" in data:
         inc["state"] = "resolved"
         inc["resolved_minute"] = ctx.now
+        eng = data["engagement_check"]
+        eng_txt = f"engagement {eng['lift']:+.1%} vs pre-incident" if "lift" in eng else eng.get("skipped", "")
         ctx.repo.decide(ctx.wf, ctx.now, "incident_resolved",
-                        f"{live} verified: flags {k}/{n} back at baseline, engagement {data['engagement_check']['lift']:+.1%} "
-                        f"vs pre-incident; time to fix {(ctx.now - inc['opened_minute'])} min",
+                        f"{live} verified: flags {k}/{n} back at baseline; {eng_txt}; open-to-verified "
+                        f"{(ctx.now - inc['opened_minute'])} min",
                         {"flags": k, "connected": n, "engagement": data["engagement_check"]}, incident_id=inc["id"],
                         dedup=f"resolved:{inc['id']}")
+
+
+def _hourly_engagement_compare(ctx: Ctx, prompt: str, a0: int, a1: int, b0: int, b1: int, exclude: str):
+    """Engagement of `prompt` in [a0,a1) vs other prompts (except `exclude`) in [b0,b1), stratified by hour."""
+    wfc, pc, xc = ctx.data.wfc(ctx.wf), ctx.data.code("prompt_version", prompt), ctx.data.code("prompt_version", exclude)
+    if wfc is None or pc is None:
+        return None
+    q = ("SELECT (((minute % 1440) + 1440) % 1440) / 60 AS h, COUNT(*), SUM(engaged) FROM calls WHERE wf=? AND "
+         "connected=1 AND minute>=? AND minute<? AND {} GROUP BY h")
+    new = {h: (n, k) for h, n, k in ctx.repo.conn.execute(q.format("p=?"), (wfc, a0, a1, pc))}
+    old = {h: (n, k) for h, n, k in ctx.repo.conn.execute(q.format("p!=?"), (wfc, b0, b1, xc if xc is not None else -1))}
+    strata = [(new[h][0], new[h][1], old[h][0], old[h][1]) for h in new if h in old]
+    return stratified_compare(strata) if strata else None
 
 
 def _note(ctx: Ctx, inc: dict, msg: str) -> None:
@@ -304,14 +336,15 @@ def _note(ctx: Ctx, inc: dict, msg: str) -> None:
     log.info("[%s] %s %s: %s", label(ctx.now), ctx.wf, inc["id"], msg)
 
 
-def _rate(det: dict) -> str:
+def _problem(det: dict, ctx: Ctx) -> str:
+    if det.get("validation"):
+        return (f"{det['validation']['prompt_version']} fails validation (pass rate "
+                f"{det['validation']['pass_rate']:.3f} < {ctx.meta.governance.min_validation_pass_rate})")
     for k in ("window", "sprt"):
         w = det.get(k) or {}
         if w.get("connected"):
-            return f"{w['flags'] / w['connected']:.1%}"
-    if det.get("validation"):
-        return f"validation pass rate {det['validation']['pass_rate']:.3f}"
-    return "?"
+            return f"hallucination flags {w['flags'] / w['connected']:.1%} vs baseline {det['baseline_rate']:.1%}"
+    return "hallucination risk"
 
 
 def _last_actor(ctx: Ctx, prompt: str) -> str | None:

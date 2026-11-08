@@ -9,7 +9,7 @@ import sys
 import time
 
 from .analysis.data import Data
-from .clock import MIN_PER_DAY, in_hours, label, ts_to_minute
+from .clock import MIN_PER_DAY, in_hours, label, next_open, ts_to_minute
 from .domain.workflow import WorkflowMeta
 from .governance.governor import Governor
 from .ingest.codec import Codec, LeadIndex
@@ -41,7 +41,6 @@ class Controller:
         self.data = Data(conn, self.codec)
         self.metas = {w["workflow_id"]: WorkflowMeta.from_api(w) for w in sim.workflows()}
         self.gov = Governor(sim, self.repo, self.metas)
-        self.gov.on_applied = self._on_applied
         self.credits = Credits(sim)
         self._cfg: dict[str, dict] = {}
         self._last_routine_eval: dict[str, int] = {}
@@ -58,14 +57,35 @@ class Controller:
             except Unavailable as e:
                 log.warning("%s: simulator unavailable this tick (%s); will retry next tick", wf, e)
         t2 = time.perf_counter()
-        last_ev = self.repo.conn.execute("SELECT MAX(until_minute) FROM chunks").fetchone()[0]
+        # Lag = how far our ingested data trails the simulator: zero when every chunk it has published is in.
+        st = self.sim.state()
+        ours = self.repo.conn.execute("SELECT MAX(chunk), MAX(until_minute) FROM chunks").fetchone()
+        behind = st["chunks"] - 1 - (ours[0] if ours[0] is not None else -1)
+        lag = 0 if behind <= 0 else now - (ours[1] if ours[1] is not None else now)
         with self.repo.tx():
             self.repo.metric({
                 "minute": now, "wall": time.time(), "events": ing.events, "ingest_secs": round(t1 - t0, 3),
                 "decide_secs": round(t2 - t1, 3), "advance_secs": round(advance_secs, 3),
-                "lag_minutes": now - (last_ev if last_ev is not None else now),
+                "lag_minutes": lag,
                 "decisions": self.repo.conn.execute("SELECT COUNT(*) FROM decisions WHERE minute=?", (now,)).fetchone()[0],
-                "credits": float(self.sim.state()["credits_remaining"]), "rss_mb": round(_rss_mb(), 1)})
+                "credits": float(st["credits_remaining"]), "rss_mb": round(_rss_mb(), 1)})
+            self._health_alerts(now, lag, float(st["credits_remaining"]))
+
+    def _health_alerts(self, now: int, lag: int, credits: float) -> None:
+        """Loop-level alerts for on-call. Page only when a human must act now; everything else is a ticket."""
+        if lag > 120:
+            self.repo.alert(now, "page", None, f"ingestion is {lag} sim-minutes behind the simulator: decisions are "
+                            "stale. Check `controller status` ingest_secs and the simulator /events/chunks endpoint.",
+                            dedup=f"lag:{now // 240}")
+        if credits < self.s.credit_floor:
+            self.repo.alert(now, "ticket", None, f"credits at {credits:.0f} (< floor {self.s.credit_floor:.0f}): only "
+                            "incident work may spend now; top up before the next incident.", dedup="credits_floor")
+        for inc in self.repo.open_incidents():
+            if now - inc["opened_minute"] > 6 * 60:
+                self.repo.alert(now, "page", inc["wf"], f"[{inc['wf']}] incident {inc['id']} ({inc['kind']} on "
+                                f"{inc['subject']}) open for {(now - inc['opened_minute']) // 60}h, state {inc['state']}. "
+                                f"Run `controller why {inc['wf']} --at \"{label(now)}\"` and check the approval queue.",
+                                dedup=f"stuck:{inc['id']}")
 
     def _tick_workflow(self, wf: str, now: int) -> None:
         ctx = self._ctx(wf, now)
@@ -97,6 +117,12 @@ class Controller:
                 self.repo.put_config_version(wf, v, cfg, applied)
                 if v["actor"] == "supervisor":
                     self._on_supervisor_edit(wf, v, applied if applied is not None else now)
+                elif v["actor"].startswith("controller") and not (v.get("proposal_id") and
+                                                                  self.repo.proposal(v["proposal_id"])):
+                    self.repo.alert(now, "page", wf, f"[{wf}] config v{v['version']} was applied by a controller "
+                                    f"that is not this one (proposal {v.get('proposal_id')}). Two controllers may be "
+                                    "driving the same workflow: stop one before it fights the other.",
+                                    dedup=f"foreign:{wf}:{v['version']}")
 
     def _on_supervisor_edit(self, wf: str, v: dict, at: int) -> None:
         dims = v.get("changed_dims") or []
@@ -112,26 +138,6 @@ class Controller:
                                                      "frozen_until": until}, dedup=f"sup:{wf}:{v['version']}")
         self.repo.alert(at, "info", wf, f"[{wf}] supervisor edit v{v['version']} on {dims}", dedup=f"supa:{wf}:{v['version']}")
 
-    # ================================================================== intents (called inside the apply tx)
-    def _on_applied(self, p: Proposal, now: int) -> None:
-        for it in p.intents:
-            t = it.get("type")
-            if t == "arm":
-                if it.get("status"):
-                    self.repo.set_arm(p.wf, it["dim"], it.get("segment", "*"), it["option"], it["status"], now,
-                                      it.get("note", ""))
-                else:
-                    self.repo.clear_arm(p.wf, it["dim"], it.get("segment", "*"), it["option"])
-            elif t == "meta":
-                self.repo.set_meta(it["key"], it["value"])
-            elif t == "incident":
-                inc = self.repo.incident(it["id"])
-                if inc and inc["state"] not in ("resolved", "abandoned"):
-                    inc["state"] = it["state"]
-                    inc["data"]["candidate"] = it.get("candidate")
-                    inc["data"]["verify_since"] = now
-                    self.repo.put_incident(inc)
-
     # ================================================================== incidents (C8)
     def _incidents(self, ctx: Ctx) -> None:
         if not self.repo.open_incidents(ctx.wf, "hallucination"):
@@ -143,10 +149,24 @@ class Controller:
         for inc in self.repo.open_incidents(ctx.wf, "hallucination"):
             if inc["state"] != "open":
                 continue
+            # Crash between "proposal submitted" and "incident updated"? The proposal's intents name the
+            # incident, so the link is recovered from the proposals table instead of re-proposing.
+            linked = next((p for p in self.gov.in_flight(ctx.wf)
+                           if any(i.get("type") == "incident" and i.get("id") == inc["id"] for i in p.intents)), None)
+            if linked:
+                inc["state"] = "fixing"
+                inc["data"]["proposal_id"] = linked.proposal_id
+                self.repo.put_incident(inc)
+                continue
             if self.gov.requests_used(ctx.wf, ctx.now) >= ctx.meta.governance.max_requests_per_24h:
                 self.repo.decide(ctx.wf, ctx.now, "incident_blocked", "approver request limit reached; fix "
                                  "will be proposed when a slot frees", {}, incident_id=inc["id"],
                                  dedup=f"blocked:{inc['id']}:{ctx.now // 240}")
+                continue
+            if not self._decidable(ctx):
+                self.repo.decide(ctx.wf, ctx.now, "incident_deferred", "a request now would expire before the "
+                                 "approver's next working window; proposing when it opens", {}, incident_id=inc["id"],
+                                 dedup=f"defer:{inc['id']}:{ctx.now // MIN_PER_DAY}")
                 continue
             change = incident.prepare_fix(ctx, inc, self.credits, self.sim)
             if change is None:
@@ -185,7 +205,16 @@ class Controller:
         if sub is None:
             return
         if sub.route == "approval":
-            if any(p.kind != "routine" for p in self.gov.in_flight(ctx.wf, "approval")):
+            pending = self.gov.in_flight(ctx.wf, "approval")
+            if pending:
+                # Anything already in the approver's queue will move the base version when it applies and
+                # make this request stale - burning one of the day's limited requests for nothing. Wait for
+                # it to resolve (at most the approver's latency), then ask on the fresh base.
+                self.repo.decide(ctx.wf, ctx.now, "safety_waiting", f"{sub.summary} - waiting for "
+                                 f"{pending[0].approval_id or pending[0].proposal_id} to resolve first",
+                                 {}, dedup=f"swait:{ctx.wf}:{pending[0].proposal_id}")
+                return
+            if not self._decidable(ctx):
                 return
             if self.gov.requests_used(ctx.wf, ctx.now) >= ctx.meta.governance.max_requests_per_24h:
                 self.repo.decide(ctx.wf, ctx.now, "safety_blocked", f"{sub.summary} - approver limit reached",
@@ -218,6 +247,13 @@ class Controller:
         if sub.route == "auto" and not self._auto_slot_ok(ctx):
             return
         self.gov.submit(sub, ctx.now)
+
+    def _decidable(self, ctx: Ctx) -> bool:
+        """Would a request sent now be decided before it expires? The approver only decides inside
+        approver_hours, after a latency of up to approver_latency_minutes[1]."""
+        gov = ctx.meta.governance
+        worst = next_open(next_open(ctx.now, gov.approver_hours) + gov.approver_latency_minutes[1], gov.approver_hours)
+        return worst <= ctx.now + gov.proposal_ttl_hours * 60
 
     def _approval_slot_ok(self, ctx: Ctx) -> bool:
         s, gov, now = self.s, ctx.meta.governance, ctx.now

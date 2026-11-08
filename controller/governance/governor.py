@@ -53,16 +53,40 @@ class Submission:
     expires_in_hours: float | None = None
 
 
+def apply_intents(repo: Repo, p: Proposal, now: int) -> None:
+    """Learning-state transitions that ride on a proposal. Called inside the transaction that marks the
+    proposal APPLIED, so state flips if and only if the change really went live."""
+    for it in p.intents:
+        t = it.get("type")
+        if t == "arm":
+            if it.get("status"):
+                repo.set_arm(p.wf, it["dim"], it.get("segment", "*"), it["option"], it["status"], now, it.get("note", ""))
+            else:
+                repo.clear_arm(p.wf, it["dim"], it.get("segment", "*"), it["option"])
+        elif t == "meta":
+            repo.set_meta(it["key"], it["value"])
+        elif t == "incident":
+            inc = repo.incident(it["id"])
+            if inc and inc["state"] not in ("resolved", "abandoned"):
+                inc["state"] = it["state"]
+                inc["data"]["candidate"] = it.get("candidate")
+                inc["data"]["candidate_source"] = it.get("source")
+                inc["data"]["verify_since"] = now
+                repo.put_incident(inc)
+
+
 class Governor:
     def __init__(self, sim: SimClient, repo: Repo, metas: dict[str, WorkflowMeta]):
         self.sim, self.repo, self.metas = sim, repo, metas
-        self.on_applied: Callable[[Proposal, int], None] = lambda p, now: None
+        self.on_applied: Callable[[Proposal, int], None] = lambda p, now: apply_intents(repo, p, now)
         self.on_closed: Callable[[Proposal, int], None] = lambda p, now: None
 
     # ------------------------------------------------------------------ submit
     def submit(self, sub: Submission, now: int) -> Proposal:
         n = self.repo.count_proposals(sub.wf, now)
-        pid = f"{sub.wf}.{now}.{sub.kind}.{n}"
+        # Deterministic within this store; the store id keeps two stores (e.g. a stray second controller)
+        # from ever colliding on the simulator's idempotency key.
+        pid = f"{self.repo.store_id()}.{sub.wf}.{now}.{sub.kind}.{n}"
         body = {"proposal_id": pid, "workflow_id": sub.wf, "base_version": sub.base_version,
                 "proposed_config": sub.config}
         if sub.route == "approval":

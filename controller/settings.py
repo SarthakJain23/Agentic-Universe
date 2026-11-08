@@ -33,19 +33,26 @@ class Settings:
     # ---- experiments (C6/C7) ----------------------------------------------------------------------
     explore_share: float = 0.06         # per challenger. 3 challengers x 6% x (worst plausible -12%)
     max_concurrent_challengers: int = 3  #   ~= -2% worst case; typical mixed effects ~ 0 (grader: -1%)
+    max_challengers_per_dim: int = 2    # so one change never explores more than 12% of a dimension
     raise_share: float = 0.25           # a challenger that is probably better gets more traffic
     raise_prob: float = 0.90            # P(better) needed to raise ...
     raise_min_n: int = 150              # ... and at least this many connected calls (normal approx is poor below)
     drop_prob: float = 0.80             # P(worse) needed to drop an arm ...
     drop_min_n: int = 150               # ... once it has this many connected calls
     promote_min_n: int = 400            # connected calls per arm before a winner can be declared
+    promote_window_days: int = 2        # winners must be winning *now*: effects fade with exposure
+    adapt_window_days: int = 4          # drop/raise decisions use up to 4 days so small arms reach n
+    fading_min_n: int = 80              # a challenger losing over the last 36h is dropped at this n
+    promote_recent_p: float = 0.60      # and the last 24h must still favour them
     promote_alpha: float = 0.05         # family-wise, Holm across challengers x segments
     min_lift: float = 0.0               # a promoted arm must beat champion (one-sided)
     holdout_share: float = 0.10         # old champion keeps 10% after promotion, to detect decay
     decay_window_hours: int = 24
     decay_min_n: int = 100              # holdout connected calls needed in the decay window
-    decay_prob: float = 0.80            # P(winner < holdout) that triggers rollback, or ...
-    decay_trend_z: float = 2.0          # ... recent lift significantly below the lift we promoted on
+    decay_prob: float = 0.95            # P(winner < holdout) that triggers rollback, or ...
+    decay_trend_z: float = 2.5          # ... recent lift significantly below the lift we promoted on
+    decay_check_every_minutes: int = 120  # sliding-window re-tests are correlated looks; fewer looks, fewer false rollbacks
+    decay_min_advantage: float = 0.01   #     AND no longer meaningfully better (<= +1%) than the holdout
     segment_min_share: float = 0.10     # single-feature segments tested for heterogeneity
     max_segment_rules: int = 2          # segment-specific allocations per dimension
     experiment_on_pickup_primary: bool = False  # welcome/voice cannot move pickup; don't risk the guardrail
@@ -58,6 +65,7 @@ class Settings:
                                         # number's ratio to ~0.8 (health = base/(1+(load/l0)^2)); flagged
                                         # numbers sit far lower, so the safety trigger is set well below that
     did_bad_p: float = 0.001
+    did_sudden_drop: float = 0.70       # ratio now / ratio in the previous 48h: flagged = sudden, load = gradual
     did_keep_ratio: float = 0.70        # below this a number gets no weight in the steady-state target
     did_probe_share: float = 0.04       # per never-used number; keeps a bad probe under the -2% bar
     did_rebalance_min_tv: float = 0.10

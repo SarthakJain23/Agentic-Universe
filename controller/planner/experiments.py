@@ -27,14 +27,17 @@ def _code(ctx: Ctx, dim: str):
 def arm_state(ctx: Ctx, dim: str) -> dict:
     cur = dist(ctx.config, "default", dim)
     statuses = ctx.repo.arm_status(ctx.wf, dim)
-    holdout = next((o for o, st in statuses.items() if st["status"] == "holdout" and cur.get(o, 0) > 0), None)
-    pool = [o for o in cur if o != holdout] or list(cur)
-    champion = max(pool, key=lambda o: (cur[o], o))
-    challengers = sorted(o for o in cur if o not in (champion, holdout))
     closed = {o for o, st in statuses.items() if st["status"] in ("dropped", "retired")}
+    # Arms we closed but that still carry traffic (an auto-applied step of a larger move): never champion,
+    # keep draining them until they reach zero.
+    draining = sorted(o for o in cur if o in closed)
+    holdout = next((o for o, st in statuses.items() if st["status"] == "holdout" and cur.get(o, 0) > 0), None)
+    pool = [o for o in cur if o != holdout and o not in closed] or [o for o in cur if o not in closed] or list(cur)
+    champion = max(pool, key=lambda o: (cur[o], o))
+    challengers = sorted(o for o in cur if o not in (champion, holdout) and o not in closed)
     untested = [o for o in ctx.meta.options[dim] if o not in cur and o not in closed]
     return {"dist": cur, "champion": champion, "holdout": holdout, "challengers": challengers,
-            "closed": sorted(closed), "untested": untested}
+            "closed": sorted(closed), "draining": draining, "untested": untested}
 
 
 def enabled(ctx: Ctx) -> bool:
@@ -71,10 +74,14 @@ def plan_routine(ctx: Ctx) -> list[Change]:
         if ctx.is_frozen(dim):
             continue
         st = states[dim]
-        since = ctx.now - 4 * DAY
+        # Two horizons: promotion looks at the last `promote_window_days` (winners must be winning now);
+        # adaptation (drop / raise) uses up to `adapt_window_days` so a 6% arm accumulates enough calls.
+        since = ctx.now - s.promote_window_days * DAY
         table = ArmTable.build(ctx.data.arm_rows(ctx.wf, dim, since, ctx.now))
         ev = evaluate(table, st["champion"], st["challengers"], _code(ctx, dim), s.promote_alpha, s.promote_min_n)
-        target = dict(st["dist"])
+        adapt_table = ArmTable.build(ctx.data.arm_rows(ctx.wf, dim, ctx.now - s.adapt_window_days * DAY, ctx.now))
+        adapt = evaluate(adapt_table, st["champion"], st["challengers"], _code(ctx, dim), s.promote_alpha, 10**9)
+        target = {o: w for o, w in st["dist"].items() if o not in st["draining"]}
         notes, intents, kinds = [], [], []
         impact = 0.0
         if ev.winners:
@@ -84,9 +91,9 @@ def plan_routine(ctx: Ctx) -> list[Change]:
             # Don't promote an arm that is already fading: the last 24h must not point the other way.
             recent = ArmTable.build(ctx.data.arm_rows(ctx.wf, dim, ctx.now - DAY, ctx.now)).compare(
                 ctx.data.code(dim, w), ctx.data.code(dim, st["champion"]))
-            if recent.n_a >= 50 and recent.p_better < 0.5:
+            if recent.n_a >= 50 and recent.p_better < s.promote_recent_p:
                 ok = False
-                notes.append(f"{w} won over 4 days but is not ahead in the last 24h "
+                notes.append(f"{w} won over {s.promote_window_days} days but is not clearly ahead in the last 24h "
                              f"(lift {recent.lift:+.1%}); waiting")
             elif ok:
                 target = {w: 1 - s.holdout_share, st["champion"]: s.holdout_share}
@@ -96,7 +103,8 @@ def plan_routine(ctx: Ctx) -> list[Change]:
                 notes.append(f"promote {w} over {st['champion']} (engagement {c.lift:+.1%}, n={c.n_a}, "
                              f"p={ev.pvalues[w]:.3g} Holm-adjusted family of {len(ev.pvalues)})")
                 intents += [{"type": "meta", "key": f"promoted:{ctx.wf}:{dim}",
-                             "value": {"winner": w, "over": st["champion"], "lift": c.lift, "minute": ctx.now}},
+                             "value": {"winner": w, "over": st["champion"], "lift": c.lift,
+                                       "lift_se": c.se / c.rate_b if c.rate_b else None, "minute": ctx.now}},
                             {"type": "arm", "dim": dim, "segment": "*", "option": w, "status": None},
                             {"type": "arm", "dim": dim, "segment": "*", "option": st["champion"],
                              "status": "holdout", "note": f"holdout after {w} promoted"}]
@@ -112,11 +120,11 @@ def plan_routine(ctx: Ctx) -> list[Change]:
         if not kinds:
             recent_t = ArmTable.build(ctx.data.arm_rows(ctx.wf, dim, ctx.now - int(1.5 * DAY), ctx.now))
             for o in st["challengers"]:
-                c = ev.comparisons.get(o)
+                c = adapt.comparisons.get(o)
                 if c is None:
                     continue
                 r = recent_t.compare(ctx.data.code(dim, o), ctx.data.code(dim, st["champion"]))
-                fading = r.n_a >= 100 and r.p_worse >= s.drop_prob
+                fading = r.n_a >= s.fading_min_n and r.p_worse >= s.drop_prob
                 if (c.n_a >= s.drop_min_n and c.p_worse >= s.drop_prob) or fading:
                     c = r if fading and not (c.n_a >= s.drop_min_n and c.p_worse >= s.drop_prob) else c
                     target.pop(o, None)
@@ -132,7 +140,8 @@ def plan_routine(ctx: Ctx) -> list[Change]:
                     kinds.append("raise_arm")
                     notes.append(f"give {o} more traffic (P(better)={c.p_better:.2f}, n={c.n_a})")
                     impact += max(c.lift_ci()[0], 0) * s.raise_share / 0.10
-            slots = s.max_concurrent_challengers - active
+            in_dim = sum(1 for o in target if o not in (st["champion"], st["holdout"]))
+            slots = min(s.max_concurrent_challengers - active, s.max_challengers_per_dim - in_dim)
             for o in st["untested"][:max(slots, 0)]:
                 target[o] = s.explore_share
                 active += 1
@@ -159,7 +168,7 @@ def plan_routine(ctx: Ctx) -> list[Change]:
                        f"(alpha={s.promote_alpha}) with >= {s.promote_min_n} connected calls per arm; the old "
                        f"champion keeps {s.holdout_share:.0%} as a holdout to catch decay."),
             edit=edit, evidence={"dim": dim, "state": st, "evaluation": ev.evidence()},
-            dry_run=dry_run(ctx, dim, table, st["dist"], target),
+            dry_run=dry_run(ctx, dim, adapt_table, st["dist"], target),
             impact=impact, intents=intents, customer_facing=True,
             needs_approval=(kind in ("promote", "raise_arm"))))
     return changes
@@ -171,7 +180,10 @@ def plan_decay(ctx: Ctx) -> list[Change]:
     out = []
     for dim in EXPERIMENT_DIMS:
         st = arm_state(ctx, dim)
-        if not st["holdout"]:
+        if st["draining"]:
+            out.append(_drain(ctx, dim, st))
+            continue
+        if not st["holdout"] or ctx.now % s.decay_check_every_minutes:
             continue
         champ, hold = st["champion"], st["holdout"]
         c = None
@@ -184,10 +196,17 @@ def plan_decay(ctx: Ctx) -> list[Change]:
             continue
         promo = ctx.repo.meta(f"promoted:{ctx.wf}:{dim}") or {}
         promo_lift = promo.get("lift") if promo.get("winner") == champ else None
+        promo_se = promo.get("lift_se") or 0.0
         se_rel = c.se / c.rate_b if c.rate_b > 0 else None
-        trend_z = (c.lift - promo_lift) / se_rel if promo_lift is not None and se_rel else None
+        # Fade test: recent lift vs the promoted lift, counting BOTH estimates' noise. The promoted lift is
+        # also shrunk by one s.e. because it was selected for being significant (winner's curse).
+        trend_z = None
+        if promo_lift is not None and se_rel:
+            trend_z = (c.lift - (promo_lift - promo_se)) / (se_rel ** 2 + promo_se ** 2) ** 0.5
         losing = c.p_worse >= s.decay_prob
-        faded = trend_z is not None and trend_z <= -s.decay_trend_z and c.lift < promo_lift / 2
+        # "Stopped winning", not merely "wins by less": at large n a fade from +15% to +7% is significant
+        # but rolling back then would hurt. Require the advantage to be essentially gone as well.
+        faded = trend_z is not None and trend_z <= -s.decay_trend_z and c.lift <= s.decay_min_advantage
         if not (losing or faded):
             continue
         why = (f"probably worse than holdout {hold} (P={c.p_worse:.2f})" if losing else
@@ -217,6 +236,21 @@ def plan_decay(ctx: Ctx) -> list[Change]:
     return out
 
 
+def _drain(ctx: Ctx, dim: str, st: dict) -> Change:
+    """Finish removing arms we already closed (a policy-limited auto step left some traffic on them)."""
+    target = quantize({o: w for o, w in st["dist"].items() if o not in st["draining"]})
+
+    def edit(cfg: dict, dim=dim, target=target) -> None:
+        cfg["allocations"]["default"][dim] = target
+
+    return Change(
+        kind="rollback", summary=f"{dim}: finish moving traffic off {', '.join(st['draining'])} (closed earlier)",
+        rationale="These options were dropped or rolled back by an earlier decision; the auto-apply step limit "
+                  "left some traffic on them. Continue until they reach zero.",
+        edit=edit, evidence={"dim": dim, "state": st}, dry_run={"method": "continuation of an applied decision"},
+        impact=0.2, customer_facing=True, safety=True)
+
+
 def dry_run(ctx: Ctx, dim: str, table: ArmTable, cur: dict, new: dict) -> dict:
     """Replay recent connected calls: expected engagement under current vs proposed allocation using each
     arm's observed rate. Arms without data are flagged rather than assumed."""
@@ -236,7 +270,7 @@ def dry_run(ctx: Ctx, dim: str, table: ArmTable, cur: dict, new: dict) -> dict:
         return sum(w * rates.get(o, (ref, 0))[0] for o, w in d.items())
 
     e0, e1 = expect(cur), expect(new)
-    return {"method": "replay of last 4 days' connected calls with observed per-arm engagement",
+    return {"method": "replay of recent connected calls with observed per-arm engagement",
             "arm_rates": {o: {"engagement": round(r, 4), "n": n} for o, (r, n) in rates.items()},
             "no_evidence_arms": sorted(no_data),
             "expected_engagement_current": None if e0 is None else round(e0, 4),
