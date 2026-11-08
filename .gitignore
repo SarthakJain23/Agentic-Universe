@@ -2,3 +2,8 @@ runs/
 __pycache__/
 *.pyc
 .venv/
+state/
+logs/
+*.db
+*.db-wal
+*.db-shm
